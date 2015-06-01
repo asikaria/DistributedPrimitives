@@ -17,10 +17,10 @@ namespace PartitioningApp
         static void Main(string[] args)
         {
             PartitioningApp app = new PartitioningApp();
-            TablePartitioningService ps = TablePartitioningService.getInstance(storageAccountName, storageAccountKey, storageTableName);
+            TablePartitioningService ps = TablePartitioningService.GetInstance(storageAccountName, storageAccountKey, storageTableName);
             Random rng = new Random();
             string nodeID = "N" + rng.Next(1000).ToString("D3");
-            ps.init(64, 10, 30, 60, 64, nodeID, app);
+            ps.Init(64, 10, 30, 60, 64, nodeID, app);
             Console.WriteLine("Started Node ID {0}", nodeID);
 
         }

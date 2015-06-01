@@ -9,19 +9,21 @@ using Microsoft.WindowsAzure.Storage.Table;
 using System.Net;
 using System.Threading;
 using System.Web;
+using System.Diagnostics;
 
 
 namespace DistributedPrimitives.PartitioningService
 {
     public class TablePartitioningService : IParticipant
     {
-        private int numPartitions;
+        private int NumPartitions;
         private int heartbeatIntervalInSeconds;
         private IParticipantCallbacks callbackObject;
-        private int maxPartitionsPerNode = 0;
+        private int maxPartitionsPerNode = 16;
         private string nodeId;
         private int leaseValidityInSeconds;
         private int acquireLeaseOlderThanSeconds;
+        private int maxPartitionAcquiresPerCycle = 3;
 
         private string storageAccountName;
         private string storageAccountKey;
@@ -30,12 +32,22 @@ namespace DistributedPrimitives.PartitioningService
         private Thread t;
         bool initialized = false;
 
-        private const string nodeIdPropertyName = "NodeID";
-        private const string loadDataPropertyName = "LoadData";
+        private Dictionary<string, Lease> allLeases = new Dictionary<string, Lease>(8192);
+        private int numLeasesHeld;
 
+        private const string NodeIdPropertyName = "NodeID";
+        private const string LoadDataPropertyName = "LoadData";
+        private const string PartitionInvalidPropertyName = "PartitionInvalid";
+        private const string DisallowedNodePropertyName = "DisallowedNode";
+        private const string LeaseGivenUpPropertyName = "LeaseGivenUp";
+        
+
+        // Usually the accesses to the lease table is done by the one partitioning service thread. 
+        // However, the IParticipant calls happen on the app's thread(s), so access to the lease table 
+        // needs to be synchronized
         private object lockObj = new Object();
         
-        public static TablePartitioningService getInstance(string storageAccountName, string storageAccountKey, string tableName)
+        public static TablePartitioningService GetInstance(string storageAccountName, string storageAccountKey, string tableName)
         {
             ServicePointManager.DefaultConnectionLimit = 100;
             ServicePointManager.Expect100Continue = false;
@@ -49,13 +61,13 @@ namespace DistributedPrimitives.PartitioningService
             return p;
         }
 
-        public void init(int numPartitions, int heartbeatIntervalInSeconds, int leaseValidityInSeconds, int acquireLeaseOlderThanSeconds, int maxPartitionsPerNode, string nodeId, IParticipantCallbacks callbackObject)
+        public void Init(int numPartitions, int heartbeatIntervalInSeconds, int leaseValidityInSeconds, int acquireLeaseOlderThanSeconds, int maxPartitionsPerNode, string nodeId, IParticipantCallbacks callbackObject)
         {
             lock (lockObj)
             {
                 if (!initialized)
                 {
-                    this.numPartitions = numPartitions;
+                    this.NumPartitions = numPartitions;
                     this.heartbeatIntervalInSeconds = heartbeatIntervalInSeconds;
                     this.callbackObject = callbackObject;
                     this.maxPartitionsPerNode = maxPartitionsPerNode;
@@ -63,9 +75,10 @@ namespace DistributedPrimitives.PartitioningService
                     this.leaseValidityInSeconds = leaseValidityInSeconds;
                     this.acquireLeaseOlderThanSeconds = acquireLeaseOlderThanSeconds;
 
-                    checkTable(); // create Table Rows
+                    CheckTable(); // create Table Rows
+                    GetMaxPartitions(); 
                     t = new Thread(threadMethod);
-                    t.Start();  //start Thread
+                    t.Start();  
                     initialized = true;
                 }
             }
@@ -73,27 +86,49 @@ namespace DistributedPrimitives.PartitioningService
         }
 
 
-        private void checkTable()
+        private void CheckTable()
         {
             StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
             CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
             CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
             CloudTable table = tableClient.GetTableReference(tableName);
 
+            // Running a query has the effect of validating that account exists and is reachable, key is correct, table exists
             TableQuery query = new TableQuery();
             query.FilterString = "PartitionKey eq 'Control' and RowKey eq 'Created'";
-            IEnumerable<DynamicTableEntity> results = table.ExecuteQuery(query);        // this will throw StorageException for any issues with the account
+            IEnumerable<DynamicTableEntity> results = table.ExecuteQuery(query);        // this will throw StorageException for any issues with the account or table
             if (results.Count() <= 0) throw new ArgumentException(String.Format("Partition rows have not been created in Table {0}", tableName));
 
-            TableQuery query2 = new TableQuery();
-            query2.FilterString = "PartitionKey eq 'Control' and RowKey eq 'MaxPartitionsPerNode'";
-            IEnumerable<DynamicTableEntity> results2 = table.ExecuteQuery(query2);
-            foreach (DynamicTableEntity row in results2)
+        }
+
+
+        private void GetMaxPartitions()
+        {
+            StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
+            CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
+            CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
+            CloudTable table = tableClient.GetTableReference(tableName);
+
+            TableQuery query;
+            IEnumerable<DynamicTableEntity> results;
+
+            query = new TableQuery();
+            query.FilterString = "PartitionKey eq 'Control' and RowKey eq 'MaxPartitionsPerNode'";
+            results = table.ExecuteQuery(query);
+            foreach (DynamicTableEntity row in results)
             {
                 this.maxPartitionsPerNode = (int)row["MaxPartitions"].Int32Value;
             }
 
+            query = new TableQuery();
+            query.FilterString = "PartitionKey eq 'Control' and RowKey eq 'MaxPartitionAcquiresPerCycle'";
+            results = table.ExecuteQuery(query);
+            foreach (DynamicTableEntity row in results)
+            {
+                this.maxPartitionAcquiresPerCycle = (int)row["MaxPerCycle"].Int32Value;
+            }
         }
+
 
         private void threadMethod()
         {
@@ -101,205 +136,345 @@ namespace DistributedPrimitives.PartitioningService
             {
                 lock (lockObj)
                 {
-                    renewLeases();
-                    expireLeases();
-                    acquireLeases();
+                    RefreshLeaseStateFromServer();
                 }
                 Thread.Sleep(heartbeatIntervalInSeconds * 1000);
             }
         }
 
-        //private List<CurrentLease> currentLeases = new List<CurrentLease>(64);
-        private SortedDictionary<string,CurrentLease> currentLeases = new SortedDictionary<string,CurrentLease>();
-        private int numLeasesHeld;
 
-        private void renewLeases()
+
+        /*
+         * Server Table Schema:
+         * Partition Key:    Partition ID
+         * Row Key:          "0"  (not used)
+         * NodeId:           ID of the node that currently owns the lease (may be expired)
+         * LoadData:         opaque string containing load information for that partition. This can be used for load-balancing operations in future (not implemented currently)
+         * LeaseGivenUp:     last holder has voluntarily relinquished lease. Ok to acquire even if ETag refresh is recent
+         * PartitionInvalid: partition is not valid to load (admin can set this). Drop partition if owning. Do not acquire at acquire time. 
+         * DisallowedNode:   NodeID of node not allowed to load this partition (admin can set this)
+        */
+
+        private void RefreshLeaseStateFromServer()
         {
-            Console.WriteLine("Renew Leases");
-            List<string> leasesToRemove = new List<string>(256);
-            foreach (KeyValuePair<string, CurrentLease> kvp in currentLeases)
+            Console.Write("Renew Leases: Scanning: ");
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            List<Lease> LeasesToRenew = new List<Lease>(maxPartitionsPerNode);    // leases we own, that can be renewed
+            List<Lease> LeasesLost = new List<Lease>(maxPartitionsPerNode);       // leases we own that we need to give up
+            List<Lease> LeasesToAcquire = new List<Lease>(maxPartitionsPerNode);  // leases that can be acquired
+            List<Lease> LeasesToDelete = new List<Lease>(maxPartitionsPerNode);   // partition IDs that are not valid anymore
+
+            lock (lockObj)
             {
-                CurrentLease lease = kvp.Value;
+                // Mark part of mark-and-sweep GC for invalid lease entries in local lease table
+                foreach (Lease lease in allLeases.Values) { lease.MarkedforGC = true; }
+            }
+
+            //update local lease table from Server
+            StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
+            CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
+            CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
+            CloudTable table = tableClient.GetTableReference(tableName);
+            TableQuery query = new TableQuery();
+            query.FilterString = "PartitionKey gt 'x' and PartitionKey lt 'y'";    //Partition IDs are always 'x' followed by a hex number. 
+            IEnumerable<DynamicTableEntity> results = table.ExecuteQuery(query);
+            DateTime now = DateTime.Now;
+            DateTime AquirableLeaseTimestamp = now.AddSeconds(-this.acquireLeaseOlderThanSeconds);
+            DateTime StaleLeaseTimestamp = DateTime.Now.AddSeconds(-this.leaseValidityInSeconds);
+            foreach (DynamicTableEntity row in results)
+            {
+                // The lock should be inside the loop, since results is not a segmented query - the enumerator 
+                // will make a server call to get next continuation. We cannot keep lock across a 
+                // sever call. One bad side effect is that for most rows, this will do a lot of repeated 
+                // acquire/release of the lock. Usually the lock is uncontended, so it should not be a problem
+                lock (lockObj)
+                {
+                    Lease lease;
+                    if (!allLeases.ContainsKey(row.PartitionKey))
+                    {   // this is a new partition we dont know about. Add it to our list
+                        lease = new Lease(row.PartitionKey);
+                        lease.RowId = row.RowKey;
+                        lease.ETag = row.ETag;
+                        lease.LastRefreshed = now;
+                        lease.LoadData = (row.Properties[LoadDataPropertyName] != null) ? row.Properties[LoadDataPropertyName].StringValue : "";
+                        lease.NodeId = (row.Properties[NodeIdPropertyName] != null) ? row.Properties[NodeIdPropertyName].StringValue : "";
+                        lease.PartitionInvalid = (row.Properties[PartitionInvalidPropertyName] != null) ? (row.Properties[PartitionInvalidPropertyName].BooleanValue ?? false) : false;
+                        lease.DisallowedNodeId = (row.Properties[DisallowedNodePropertyName] != null) ? row.Properties[DisallowedNodePropertyName].StringValue.Trim().ToLower() : "";
+                        lease.HaveLease = false;
+                        lease.MarkedforGC = false;
+                        allLeases.Add(lease.PartitionId, lease);
+                        lease = null;
+                    }
+
+
+                    lease = allLeases[row.PartitionKey];
+                    lease.MarkedforGC = false;                // valid row, do not GC
+                    lease.RowId = row.RowKey;                 // RowId is not used, so this should generally be a no-op
+                    bool ETagChanged = false;
+                    if (lease.ETag != row.ETag)
+                    {
+                        ETagChanged = true;
+                        lease.ETag = row.ETag;
+                        lease.LastRefreshed = now;            // this is the time (client time) we first saw this etag value
+                    }
+                    lease.LoadData = (row.Properties[LoadDataPropertyName] != null) ? row.Properties[LoadDataPropertyName].StringValue : "";
+                    lease.NodeId = (row.Properties[NodeIdPropertyName] != null) ? row.Properties[NodeIdPropertyName].StringValue : "";
+                    lease.PartitionInvalid = (row.Properties[PartitionInvalidPropertyName] != null) ? (row.Properties[PartitionInvalidPropertyName].BooleanValue ?? false) : false;
+                    lease.DisallowedNodeId = (row.Properties[DisallowedNodePropertyName] != null) ? row.Properties[DisallowedNodePropertyName].StringValue.Trim().ToLower() : "";
+                    bool LeaseGivenUp = (row.Properties[LeaseGivenUpPropertyName] != null) ? (row.Properties[LeaseGivenUpPropertyName].BooleanValue ?? false) : false;
+                    if (lease.HaveLease)
+                    {
+                        // if the Etag is not what we know, then someone else must have got it or invalidated it
+                        // anyone else touching the row while we have the lease is equivalent to invalidatng the lease
+                        // Also, of course, if we have not kept the lease current then someone else could have acquired it, so we need to give it up
+                        bool stale = (lease.LastRefreshed < StaleLeaseTimestamp);
+                        if (!ETagChanged && !stale)
+                        {
+                            LeasesToRenew.Add(lease);
+                        }
+                        else
+                        {
+                            LeasesLost.Add(lease);
+                        }
+                    }
+                    else
+                    {
+                        if (lease.LastRefreshed < AquirableLeaseTimestamp || LeaseGivenUp)   // Lease's ETag has not been refreshed for long time, or last holder has given up the lease
+                        {
+                            if (!lease.PartitionInvalid && !(lease.DisallowedNodeId == this.nodeId))
+                            {
+                                LeasesToAcquire.Add(lease);
+                            }
+                        }
+                    }
+                }
+            }
+
+            stopwatch.Stop();
+            Console.WriteLine(" {0} ms", stopwatch.ElapsedMilliseconds);
+
+            lock (lockObj)
+            {
+                // Sweep part of mark-and-sweep GC for invalid lease entries in local lease table
+                foreach (KeyValuePair<string, Lease> kvp in allLeases)
+                {
+                    Lease lease = kvp.Value;
+                    if (lease.MarkedforGC)
+                    {
+                        LeasesToDelete.Add(lease);
+                    }
+                }
+            }
+
+            foreach (Lease lease in LeasesLost)
+            {
+                RemoveLease(lease);
+            }
+
+            Console.WriteLine("              Acquiring: ");
+            stopwatch.Restart();
+            int acquirecount = 0;
+            foreach (Lease lease in LeasesToAcquire) {
+                if (AcquireLease(lease)) acquirecount++;
+                if (acquirecount >= maxPartitionAcquiresPerCycle) break;
+            }
+            stopwatch.Stop();
+            Console.WriteLine("              Acquire time: {0} ms", stopwatch.ElapsedMilliseconds);
+
+            Console.Write("              Renewing: ");
+            stopwatch.Restart();
+            foreach (Lease lease in LeasesToRenew)
+            {
+                RenewLease(lease);
+            }
+            stopwatch.Stop();
+            Console.WriteLine("{0} ms ", stopwatch.ElapsedMilliseconds);
+
+            foreach (Lease lease in LeasesToDelete)  { DeleteLocalLeaseEntry(lease);  }
+
+            Console.WriteLine("              Node: {0}", this.nodeId);
+        }
+
+
+        private void DeleteLocalLeaseEntry(Lease lease)
+        {
+            if (lease.HaveLease)
+            {
+                RemoveLease(lease);
+            }
+            if (allLeases.ContainsKey(lease.PartitionId))
+            {
+                allLeases.Remove(lease.PartitionId);
+            }
+        }
+
+        private void RenewLease(Lease lease)
+        {
+            {
+                string LoadData = callbackObject.getCurrentLoad(lease.PartitionId); // TODO: Add robustness here: exception, long running time, etc.
+
                 StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
                 CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
                 CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
                 CloudTable table = tableClient.GetTableReference(tableName);
-
-                DynamicTableEntity leaseRowInTable = new DynamicTableEntity(lease.partitionId, lease.rowId);
-                leaseRowInTable.Properties[nodeIdPropertyName] = new EntityProperty(nodeId);
-                leaseRowInTable.Properties[loadDataPropertyName] = new EntityProperty(callbackObject.getCurrentLoad(lease.partitionId));  // TODO: Add robustness here
+                DynamicTableEntity leaseRowInTable = new DynamicTableEntity(lease.PartitionId, lease.RowId);
+                leaseRowInTable.Properties[NodeIdPropertyName] = new EntityProperty(this.nodeId);
+                leaseRowInTable.Properties[LoadDataPropertyName] = new EntityProperty(LoadData);  
+                leaseRowInTable.Properties[LeaseGivenUpPropertyName] = new EntityProperty(false);
+                leaseRowInTable.Properties[PartitionInvalidPropertyName] = new EntityProperty(false);
+                leaseRowInTable.Properties[DisallowedNodePropertyName] = new EntityProperty("");
                 leaseRowInTable.ETag = lease.ETag;
                 TableOperation leaseUpdateOperation = TableOperation.Replace(leaseRowInTable);
-
-                
-
                 try
                 {
                     TableResult tableResult = table.Execute(leaseUpdateOperation);
-                    lease.ETag = ((DynamicTableEntity)tableResult.Result).ETag;
-                    lease.lastRefreshed = DateTime.Now;
+                    lock (lockObj)
+                    {
+                        lease.ETag = ((DynamicTableEntity)tableResult.Result).ETag;
+                        lease.LastRefreshed = DateTime.Now;
+                        lease.LoadData = LoadData;
+                        lease.NodeId = this.nodeId;
+                        lease.PartitionInvalid = false;
+                        lease.DisallowedNodeId = "";
+                        lease.HaveLease = true;
+                        // do not touch: lease.RowId, lease.MarkedForGC
+                    }
                 }
                 catch (StorageException ex)
                 {
-                    Console.WriteLine("Failed to Renew lease for partition {0}", lease.partitionId);
+                    Console.WriteLine("Failed to Renew lease for partition {0}", lease.PartitionId);
                     Console.WriteLine("     Exception {0} ({1}): {2}", ex.RequestInformation.HttpStatusCode, ex.RequestInformation.HttpStatusMessage, ex.Message);
                     if (ex.RequestInformation.HttpStatusCode == 412)
                     {
-                        leasesToRemove.Add(lease.partitionId);
+                        RemoveLease(lease);    // if I fail to renew (someone else has it), then I've lost it
                     }
                     // swallow - failed to renew lease
                     // TODO: Log it
                 }
-
             }
-            removeLeases(leasesToRemove);
         }
 
-        private void expireLeases()
+        private void RemoveLease(Lease lease)
         {
-            Console.WriteLine("Expire Leases");
-
-            List<string> leasesToRemove = new List<string>(256);
-            DateTime staleLeaseTimestamp = DateTime.Now.AddSeconds(-this.leaseValidityInSeconds);
-            foreach (KeyValuePair<string, CurrentLease> kvp in currentLeases)
+            callbackObject.lostPartition(lease.PartitionId);
+            lock (lockObj)
             {
-                CurrentLease lease = kvp.Value;
-                if (lease.lastRefreshed < staleLeaseTimestamp)
-                { // lease has expired
-                    // TODO: Log the loss of lease
-                    leasesToRemove.Add(lease.partitionId);
-                }
-            }
-            removeLeases(leasesToRemove);
-        }
-
-
-        private void removeLeases(List<string> leasesToRemove)
-        {
-            if (leasesToRemove == null) return;
-            foreach (string partitionID in leasesToRemove)
-            {
-                removeLease(partitionID);
+                lease.HaveLease = false;
+                numLeasesHeld--;
             }
         }
 
-        private void removeLease(string partitionID)
+
+        private void RemoveLeaseOnServer(Lease lease)
         {
-            if (partitionID == null || partitionID == "") return;
-
-            callbackObject.lostPartition(partitionID);
-            currentLeases.Remove(partitionID);
-            numLeasesHeld--;
-
-        }
-
-        private Dictionary<string, Lease> allLeases = new Dictionary<string, Lease>(8192);
-
-        private void acquireLeases()
-        {
-            Console.WriteLine("Renew Leases: Scanning");
-            if (numLeasesHeld >= maxPartitionsPerNode) return;
-
+            RemoveLease(lease);
+            
+            // All of the remaining is a performance optimization to let the partition be reacquired by someone else sooner
+            // Correctness is not impacted if this fails - in that case this partition will just wait for the full 
+            // Lease validity period before being acquired by someone else
             StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
             CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
             CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
             CloudTable table = tableClient.GetTableReference(tableName);
 
-            //update local lease table from Server
-            TableQuery query = new TableQuery();
-            query.FilterString = "PartitionKey gt 'x' and PartitionKey lt 'y'";
-            IEnumerable<DynamicTableEntity> results = table.ExecuteQuery(query);
-            DateTime now = DateTime.Now;
-            foreach (DynamicTableEntity row in results)
+            DynamicTableEntity leaseRowInTable = new DynamicTableEntity(lease.PartitionId, lease.RowId);
+            leaseRowInTable.Properties[NodeIdPropertyName] = new EntityProperty("");
+            leaseRowInTable.Properties[LoadDataPropertyName] = new EntityProperty("");
+            leaseRowInTable.Properties[LeaseGivenUpPropertyName] = new EntityProperty(true);
+            leaseRowInTable.Properties[PartitionInvalidPropertyName] = new EntityProperty(false);
+            leaseRowInTable.Properties[DisallowedNodePropertyName] = new EntityProperty("");
+            leaseRowInTable.ETag = lease.ETag;
+            TableOperation leaseUpdateOperation = TableOperation.Replace(leaseRowInTable);
+            try
             {
-                if (allLeases.ContainsKey(row.PartitionKey))
+                TableResult tableResult = table.Execute(leaseUpdateOperation);
+                lock (lockObj)
                 {
-                    Lease lease = allLeases[row.PartitionKey];
-                    lease.rowId = row.RowKey;
-                    if (lease.ETag != row.ETag) {
-                        lease.ETag = row.ETag;
-                        lease.lastRefreshed = now;
-                    }
-                    lease.LoadData = (row.Properties[loadDataPropertyName] != null) ? row.Properties[loadDataPropertyName].StringValue : "";
-                    lease.nodeID = (row.Properties[nodeIdPropertyName] != null) ? row.Properties[nodeIdPropertyName].StringValue : "";
-                }
-                else
-                {
-                    Lease lease = new Lease();
-                    lease.partitionId = row.PartitionKey;
-                    lease.rowId = row.RowKey;
-                    lease.ETag = row.ETag;
-                    lease.lastRefreshed = now;
-                    lease.LoadData = (row.Properties[loadDataPropertyName]!=null) ? row.Properties[loadDataPropertyName].StringValue : "";
-                    lease.nodeID = (row.Properties[nodeIdPropertyName] != null) ? row.Properties[nodeIdPropertyName].StringValue : "";
-                    allLeases.Add(lease.partitionId, lease);
-                    // TODO: Log the acquisition of Lease
+                    lease.ETag = ((DynamicTableEntity)tableResult.Result).ETag;
+                    lease.LastRefreshed = DateTime.Now;
+                    lease.LoadData = "";
+                    lease.NodeId = "";
+                    lease.PartitionInvalid = false;
+                    lease.HaveLease = false;
+                    lease.DisallowedNodeId = "";
+                    // do not touch: lease.RowId, lease.MarkedForGC
                 }
             }
-
-            Console.WriteLine("Renew Leases: Acquiring");
-            DateTime staleLeaseTimestamp = DateTime.Now.AddSeconds(-this.acquireLeaseOlderThanSeconds);
-            foreach (KeyValuePair<string, Lease> kvp in allLeases)
+            catch (StorageException ex)
             {
-                Lease lease = kvp.Value;
-                if (lease.lastRefreshed < staleLeaseTimestamp)
-                {
-                    if (numLeasesHeld < maxPartitionsPerNode)
-                    {
-                        DynamicTableEntity leaseRowInTable = new DynamicTableEntity(lease.partitionId, lease.rowId);
-                        leaseRowInTable.Properties[nodeIdPropertyName] = new EntityProperty(nodeId);
-                        leaseRowInTable.Properties[loadDataPropertyName] = new EntityProperty(""); 
-                        leaseRowInTable.ETag = lease.ETag;
-                        TableOperation leaseUpdateOperation = TableOperation.Replace(leaseRowInTable);
-                        try
-                        {
-                            TableResult tableResult = table.Execute(leaseUpdateOperation);
-                            lease.ETag = ((DynamicTableEntity)tableResult.Result).ETag;
-                            lease.lastRefreshed = now;
-
-                            CurrentLease currentLease = new CurrentLease();
-                            currentLease.partitionId = lease.partitionId;
-                            currentLease.rowId = lease.rowId;
-                            currentLease.lastRefreshed = now;
-                            currentLease.ETag = lease.ETag;
-                            currentLeases.Add(lease.partitionId, currentLease);
-
-                            numLeasesHeld++;
-                            callbackObject.gotPartition(lease.partitionId);
-                            if (numLeasesHeld >= maxPartitionsPerNode) break;
-                        }
-                        catch (StorageException ex)
-                        {
-                            Console.WriteLine("Failed to acquire lease for eligible partition {0}", lease.partitionId);
-                            Console.WriteLine("     Exception {0}({1}): {2}", ex.RequestInformation.HttpStatusCode, ex.RequestInformation.HttpStatusMessage, ex.Message);
-                            // swallow - failed to acquire lease
-                            // TODO: Log it
-                        }
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
+                Console.WriteLine("Failed to acquire lease for eligible partition {0}", lease.PartitionId);
+                Console.WriteLine("     Exception {0}({1}): {2}", ex.RequestInformation.HttpStatusCode, ex.RequestInformation.HttpStatusMessage, ex.Message);
+                // swallow - failed to acquire lease
+                // TODO: Log it
             }
         }
 
-        private class CurrentLease
+        private bool AcquireLease(Lease lease)
         {
-            public string partitionId;
-            public string rowId;
-            public string ETag;
-            public DateTime lastRefreshed; // client time
+            bool acquired = false;
+
+            if (numLeasesHeld < maxPartitionsPerNode)
+            {
+                StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
+                CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
+                CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
+                CloudTable table = tableClient.GetTableReference(tableName);
+
+                DynamicTableEntity leaseRowInTable = new DynamicTableEntity(lease.PartitionId, lease.RowId);
+                leaseRowInTable.Properties[NodeIdPropertyName] = new EntityProperty(this.nodeId);
+                leaseRowInTable.Properties[LoadDataPropertyName] = new EntityProperty("");
+                leaseRowInTable.Properties[LeaseGivenUpPropertyName] = new EntityProperty(false);
+                leaseRowInTable.Properties[PartitionInvalidPropertyName] = new EntityProperty(false);
+                leaseRowInTable.Properties[DisallowedNodePropertyName] = new EntityProperty("");
+                leaseRowInTable.ETag = lease.ETag;
+                TableOperation leaseUpdateOperation = TableOperation.Replace(leaseRowInTable);
+                try
+                {
+                    TableResult tableResult = table.Execute(leaseUpdateOperation);
+                    lock (lockObj)
+                    {
+                        lease.ETag = ((DynamicTableEntity)tableResult.Result).ETag;
+                        lease.LastRefreshed = DateTime.Now;
+                        lease.LoadData = "";
+                        lease.NodeId = this.nodeId;
+                        lease.PartitionInvalid = false;
+                        lease.HaveLease = true;
+                        lease.DisallowedNodeId = "";
+                        // do not touch: lease.RowId, lease.MarkedForGC
+                        numLeasesHeld++;
+                        acquired = true;
+                    }
+                    this.callbackObject.gotPartition(lease.PartitionId);
+                }
+                catch (StorageException ex)
+                {
+                    Console.WriteLine("Failed to acquire lease for eligible partition {0}", lease.PartitionId);
+                    Console.WriteLine("     Exception {0}({1}): {2}", ex.RequestInformation.HttpStatusCode, ex.RequestInformation.HttpStatusMessage, ex.Message);
+                    // swallow - failed to acquire lease
+                    // TODO: Log it
+                }
+            }
+            return acquired;
         }
 
         private class Lease
         {
-            public string partitionId;
-            public string rowId;
+            public readonly string PartitionId;
+            public string RowId;
             public string ETag;
-            public DateTime lastRefreshed; // client time
+            public DateTime LastRefreshed; // client time
             public string LoadData;
-            public string nodeID;
+            public string NodeId;
+            public bool PartitionInvalid;
+            public string DisallowedNodeId;
+            public bool HaveLease;
+            public bool MarkedforGC;
+
+            public Lease(string partitionId)
+            {
+                this.PartitionId = partitionId;
+            }
         }
 
         /*
@@ -315,7 +490,7 @@ namespace DistributedPrimitives.PartitioningService
             //       lock while the partitioning service is updating the tables from Azure tables
             lock (lockObj)
             {
-                if (currentLeases.ContainsKey(partitionID)) return true;
+                if (allLeases.ContainsKey(partitionID)) return allLeases[partitionID].HaveLease;
                 return false;
             }
         }
@@ -323,13 +498,12 @@ namespace DistributedPrimitives.PartitioningService
         public List<string> listOwnedPartitions()
         {
             if (!initialized) throw new InvalidOperationException("Partitioning Service instance has not been inititalized yet");
+            List<string> list = new List<string>(maxPartitionsPerNode);
             lock (lockObj)
             {
-                List<string> list = new List<string>(currentLeases.Count);
-                foreach (KeyValuePair<string, CurrentLease> kvp in currentLeases)
+                foreach (KeyValuePair<string, Lease> kvp in allLeases)
                 {
-                    CurrentLease lease = kvp.Value;
-                    list.Add(lease.partitionId);
+                    list.Add(kvp.Value.PartitionId);
                 }
                 return list;
             }
@@ -338,16 +512,15 @@ namespace DistributedPrimitives.PartitioningService
         public void dropPartition(string PartitionID)
         {
             if (!initialized) throw new InvalidOperationException("Partitioning Service instance has not been inititalized yet");
+            Lease lease = null;
             lock (lockObj)
             {
-                if (currentLeases.ContainsKey(PartitionID))
+                if (allLeases.ContainsKey(PartitionID))
                 {
-                    CurrentLease lease = currentLeases[PartitionID];
-                    callbackObject.lostPartition(lease.partitionId);
-                    currentLeases.Remove(PartitionID);
-                    numLeasesHeld--;
+                    lease = allLeases[PartitionID];
                 }
             }
+            if (lease!=null) RemoveLeaseOnServer(lease);
         }
 
         /*
@@ -356,12 +529,15 @@ namespace DistributedPrimitives.PartitioningService
          * 
         */
 
-        public void createTable(int numPartitions, int maxPartitionsPerNode)
+        public void createTable(int numPartitions, int maxPartitionsPerNode, int maxPartitionAcquiresPerCycle)
         {
             StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
             CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
             CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
             CloudTable table = tableClient.GetTableReference(tableName);
+
+            if (numPartitions > 0xffff) { throw new ArgumentException(String.Format("Maximum number of partitions is {0}", 0xffff)); }
+            if (numPartitions < maxPartitionsPerNode) { throw new ArgumentException("maxPartitionsPerNode is more than numPartitions"); }
 
             if (table.CreateIfNotExists())
             {   // if table was created in the CreateIfNotExists call
@@ -370,19 +546,31 @@ namespace DistributedPrimitives.PartitioningService
                     string partitionKey = String.Format("x{0:x4}", i);
                     string rowKey = "0";
                     DynamicTableEntity row = new DynamicTableEntity(partitionKey, rowKey);
-                    row.Properties[nodeIdPropertyName] = new EntityProperty("none");
-                    row.Properties[loadDataPropertyName] = new EntityProperty("");  
+                    row.Properties[NodeIdPropertyName] = new EntityProperty("none");
+                    row.Properties[LoadDataPropertyName] = new EntityProperty("");  
+                    row.Properties[LeaseGivenUpPropertyName] = new EntityProperty(true);  
+                    row.Properties[PartitionInvalidPropertyName] = new EntityProperty(false);  
+                    row.Properties[DisallowedNodePropertyName] = new EntityProperty("");  
                     TableOperation insertOperation = TableOperation.Insert(row);
                     table.Execute(insertOperation);
                 }
-                DynamicTableEntity controlRow = new DynamicTableEntity("Control", "Created");
-                TableOperation controlInsertOperation = TableOperation.Insert(controlRow);
+
+                DynamicTableEntity controlRow;
+                TableOperation controlInsertOperation;
+
+                controlRow = new DynamicTableEntity("Control", "Created");
+                controlInsertOperation = TableOperation.Insert(controlRow);
                 table.Execute(controlInsertOperation);
 
-                DynamicTableEntity controlRow2 = new DynamicTableEntity("Control", "MaxPartitionsPerNode");
-                controlRow2.Properties.Add(new KeyValuePair<string, EntityProperty>("MaxPartitions", new EntityProperty(maxPartitionsPerNode)));
-                TableOperation controlInsertOperation2 = TableOperation.Insert(controlRow2);
-                table.Execute(controlInsertOperation2);
+                controlRow = new DynamicTableEntity("Control", "MaxPartitionsPerNode");
+                controlRow.Properties.Add(new KeyValuePair<string, EntityProperty>("MaxPartitions", new EntityProperty(maxPartitionsPerNode)));
+                controlInsertOperation = TableOperation.Insert(controlRow);
+                table.Execute(controlInsertOperation);
+
+                controlRow = new DynamicTableEntity("Control", "MaxPartitionAcquiresPerCycle");
+                controlRow.Properties.Add(new KeyValuePair<string, EntityProperty>("MaxPerCycle", new EntityProperty(maxPartitionAcquiresPerCycle)));
+                controlInsertOperation = TableOperation.Insert(controlRow);
+                table.Execute(controlInsertOperation);
             }
             else
             {
@@ -400,22 +588,25 @@ namespace DistributedPrimitives.PartitioningService
             table.DeleteIfExists();
         }
 
-        public void kickPartition(string partitionID)
+        public void kickPartition(string partitionID, string disallowedNode = "")
         {
+            if (disallowedNode == null) { disallowedNode = "";  }
+            disallowedNode = disallowedNode.Trim();
+
             StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
             CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
             CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
             CloudTable table = tableClient.GetTableReference(tableName);
 
             DynamicTableEntity leaseRowInTable = new DynamicTableEntity(partitionID, "0");
-            leaseRowInTable.Properties[nodeIdPropertyName] = new EntityProperty("kicked");
-            leaseRowInTable.Properties[loadDataPropertyName] = new EntityProperty("");
+            leaseRowInTable.Properties[NodeIdPropertyName] = new EntityProperty("kicked");
+            leaseRowInTable.Properties[LoadDataPropertyName] = new EntityProperty("");
+            leaseRowInTable.Properties[LeaseGivenUpPropertyName] = new EntityProperty(false);
+            leaseRowInTable.Properties[PartitionInvalidPropertyName] = new EntityProperty(false);
+            leaseRowInTable.Properties[DisallowedNodePropertyName] = new EntityProperty(disallowedNode);
             leaseRowInTable.ETag = "*";
-            TableOperation leaseUpdateOperation = TableOperation.Replace(leaseRowInTable); 
 
-            OperationContext opContext = new OperationContext();
-            opContext.UserHeaders = new Dictionary<string, string>(1);
-            opContext.UserHeaders["If-Match"] = "*";
+            TableOperation leaseUpdateOperation = TableOperation.Replace(leaseRowInTable); 
             TableResult tableResult = table.Execute(leaseUpdateOperation);
         }
 

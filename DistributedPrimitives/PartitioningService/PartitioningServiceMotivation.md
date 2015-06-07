@@ -24,7 +24,6 @@ time, but if that server crashes, the processing can be restarted by another pro
 
 
 
-For details on how to use, see the [Usage](PartitioningServiceUsing.md) doc. 
-  
-
+For details on how to use, see the [usage](PartitioningServiceUsing.md) doc. 
+For details on how it can be implemented, see [design doc](PartitioningServiceDesign.md) for an implementation based on Azure Table Service.
 

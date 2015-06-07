@@ -1,3 +1,4 @@
+:u5272:
 ## How do I use the partitioning service.
 
 ### `IParticipant` and `IClient`
@@ -43,4 +44,56 @@ Get the current node serving a partition
 
   - `Dictionary<string, string> getPartitionMap()`
 Get the full partition map
+
+
+### Parameterization
+
+#### Lease renewal period
+Lease renewal period is best decided based on app requirements.  Let's take an example with a 10-seconds lease renewal period.
+
+Small intervals are better, because that results in better availability. Note that the period should be at least 2x larger 
+than potential azure storage server+network delays, otherwise there is no benefit to a short interval, and it only results in 
+extra lease renewal IOs. A larger lease renewal period results in fewer IOs to the table service.
+
+#### Lease expiry time (time at which server should stop processing a partition)
+Lease expiry time is the time it takes to safely assume that lease has not been renewed. This needs to be Lease renewal period + all the skews. So,
+>  Lease Renewal Period 
+>+ Clock drift (very small here)
+>+ Round-trip time to renew lease (say, 10-sec server timeout + 2 sec network time + 1x more of both for retry)
+>+ CPU time on local node (should be small)
+This adds up to ~30 seconds for our example
+
+The partitioning service will call dropPartition if this period elapses without the lease getting renewed.
+
+#### Lease acquisition time (when it is safe to take over a lease)
+This should be more than lease expiry time plus potential drift. Few seconds allowance should be ok. In this case we are using 45 secs. 
+
+The main thing to guarantee for safety is to make sure that in no case does a new server take over processing a partition before the 
+old server assumes itself dead. With the parameters above (10s renewal, 30s expiry), a 45-sec acquisition time is pretty safe.
+
+#### Number of servers
+Number of servers comes from load/scale characteristics of the app – i.e., how many total servers are needed to process the 
+total load. This is the minimum number of servers needed. Add some resilience allowance to that, so the app can be tolerant 
+to server failures.
+
+Note that as the number of servers goes up, so does the number of IOs on the lease table, since each server does a full scan 
+of all the rows in the lease table every renewal period. For current scale this will not be problem since we are well within 
+the 20k tps limit of an azures torage account. As scale (number of partitions/number of servers) increases, the number of IOs
+per second on the azure table should be evaluated to make sure it is within the 20K envelope.
+
+
+#### Number of partitions
+The number of partitions indicates the granularity at which the load can be distributed. If there is no load balancing needed, 
+then we can go down to 1 or 2 partitions per server, so we can grow to thousands of servers. 
+
+If load balancing is needed, then 1 or 2 per server does not provide enough granularity, and customer would want to keep at 
+least 8-10 partitions per server for effective load balancing.
+
+As the partition count goes up, the IOs on the lease table go up too. See discussion above in the section on “Number of Servers”.
+
+#### Max Number of partitions per server
+Max number of partitions is a simple calculation between server count and partition count, to make sure the number of servers 
+we have is enough to serve the number of partitions we have. Max count = ceiling(# of partitions / # of servers). 
+Once this is calculated, customer needs to throw in more servers, to ensure resilience when servers go down.
+
 

@@ -23,6 +23,8 @@ shard. This is useful for applications that have to have a "master server" per u
 time, but if that server crashes, the processing can be restarted by another process (two servers should never be processing the same resource at one time).
 
 
+
+For details on how to use, see the [Usage](PartitioningServiceUsing.md) doc. 
   
 
 

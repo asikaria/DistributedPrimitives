@@ -20,7 +20,7 @@ namespace PartitioningApp
             TablePartitioningService ps = TablePartitioningService.GetInstance(storageAccountName, storageAccountKey, storageTableName);
             Random rng = new Random();
             string nodeID = "N" + rng.Next(1000).ToString("D3");
-            ps.Init(64, 10, 30, 60, 64, nodeID, app);
+            ps.Init(64, 10, 30, 43, 64, nodeID, app);
             Console.WriteLine("Started Node ID {0}", nodeID);
 
         }

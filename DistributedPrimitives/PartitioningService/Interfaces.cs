@@ -22,4 +22,14 @@ namespace DistributedPrimitives.PartitioningService
         string getCurrentLoad(string partitionID);
     }
 
+
+    public interface IClient
+    {
+        string getOwnerNode(string partitionID);
+
+        Dictionary<string, string> getPartitionMap();
+
+
+    }
+
 }

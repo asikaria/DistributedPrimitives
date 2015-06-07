@@ -14,7 +14,7 @@ using System.Diagnostics;
 
 namespace DistributedPrimitives.PartitioningService
 {
-    public class TablePartitioningService : IParticipant
+    public class TablePartitioningService : IParticipant, IClient
     {
         private int NumPartitions;
         private int heartbeatIntervalInSeconds;
@@ -482,6 +482,7 @@ namespace DistributedPrimitives.PartitioningService
          * IParticipant Methods
          * 
         */
+
         public bool havePartition(string partitionID)
         {
             if (!initialized) throw new InvalidOperationException("Partitioning Service instance has not been inititalized yet");
@@ -522,6 +523,61 @@ namespace DistributedPrimitives.PartitioningService
             }
             if (lease!=null) RemoveLeaseOnServer(lease);
         }
+
+
+        /*
+         * 
+         * IClient Methods
+         * 
+        */
+
+        public string getOwnerNode(string partitionID)
+        {
+            string owner = null;
+
+            StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
+            CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
+            CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
+            CloudTable table = tableClient.GetTableReference(tableName);
+
+            //update local lease table from Server
+            TableQuery query = new TableQuery();
+            query.FilterString = String.Format(@"PartitionKey eq '{0}' and PartitionKey eq '0'", partitionID);
+            IEnumerable<DynamicTableEntity> results = table.ExecuteQuery(query);
+            foreach (DynamicTableEntity row in results)
+            {
+                if (row.Properties.ContainsKey(NodeIdPropertyName))
+                {
+                    owner = row.Properties[NodeIdPropertyName].StringValue;
+                }
+            }
+            return owner;
+        }
+
+        public Dictionary<string, string> getPartitionMap()
+        {
+            Dictionary<string, string> result = new Dictionary<string, string>(8192);
+
+            StorageCredentials creds = new StorageCredentials(storageAccountName, storageAccountKey);
+            CloudStorageAccount storageAccount = new CloudStorageAccount(creds, true);
+            CloudTableClient tableClient = storageAccount.CreateCloudTableClient();
+            CloudTable table = tableClient.GetTableReference(tableName);
+
+            //update local lease table from Server
+            TableQuery query = new TableQuery();
+            query.FilterString = "PartitionKey gt 'x' and PartitionKey lt 'y'";
+            IEnumerable<DynamicTableEntity> results = table.ExecuteQuery(query);
+            foreach (DynamicTableEntity row in results)
+            {
+                if (row.Properties.ContainsKey(NodeIdPropertyName))
+                {
+                    result[row.PartitionKey] = row.Properties[NodeIdPropertyName].StringValue;
+                }
+            }
+            return result;
+        }
+
+
 
         /*
          * 

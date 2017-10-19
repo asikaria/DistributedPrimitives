@@ -1,6 +1,5 @@
 # Distributed Primitives
 #### A Library of primitives needed to build resilient scalable distributed systems
-*Because building a distributed system should not require a Ph.D.*
 
 These are the libraries planned, currently only the first one is implemented:
   - [Partitioning service](DistributedPrimitives/PartitioningService/README.md)
